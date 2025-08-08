@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nokia Snake – Canvas Edition</title>
+  <style>
+    :root { --bg: #0b0f14; }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body { margin: 0; background: radial-gradient(1200px 800px at 50% -10%, #12202f 0%, var(--bg) 60%); display: grid; place-items: center; overflow: hidden; }
+    #game { display:block; border-radius: 18px; background:#0b1118; box-shadow: 0 25px 60px rgba(0,0,0,0.35); outline:none; }
+  </style>
+</head>
+<body>
+  <canvas id="game" aria-label="Snake game canvas" tabindex="0"></canvas>
+  <script>
+  (function(){
+    // ===== Config =====
+    const GRID = 30;              // 30x30 grid
+    const BASE_FPS = 7;           // starting moves per second
+    const TREE_START = 16;        // initial obstacles
+
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+
+    // Device pixel ratio handling for crisp canvas
+    let DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    let CELL = 22; // computed on resize
+    let SIZE = GRID; // cell count per side
+
+    function resize(){
+      const target = Math.min(window.innerWidth*0.92, window.innerHeight*0.92);
+      const raw = Math.floor(target);
+      CELL = Math.max(14, Math.floor(raw / GRID));
+      const px = CELL * GRID;
+      canvas.style.width = px + 'px';
+      canvas.style.height = px + 'px';
+      canvas.width = Math.floor(px * DPR);
+      canvas.height = Math.floor(px * DPR);
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+      draw();
+    }
+    window.addEventListener('resize', resize);
+
+    // ===== Game State =====
+    const State = {
+      snake: [], // array of {x,y}
+      dir: {x:1,y:0},
+      nextDir: {x:1,y:0},
+      food: {x:0,y:0}, // rat
+      trees: [], // array of {x,y,seed}
+      running: false,
+      gameOver: false,
+      score: 0,
+      speed: BASE_FPS, // moves per second
+      lastStep: 0,
+      stepInterval: 1000/BASE_FPS,
+      // new
+      mode: 'classic', // 'classic' (walls) or 'wrap'
+      level: 1,
+      foodsEaten: 0,
+      // timed tree growth
+      treeTimerMs: 0,
+      treeIntervalMs: 14000, // adds a tree every X ms, reduced with level
+      awaitingModePick: true,
+    };
+
+    const LEVELS = [ // level-up after reaching these total foods eaten
+      0,   // level 1 starts at 0
+      4,   // -> level 2 at 4
+      9,   // -> level 3 at 9
+      15,  // -> level 4 at 15
+      22   // -> level 5 at 22
+    ];
+
+    function init(){
+      State.snake = [ {x: 5, y: 15}, {x:4,y:15}, {x:3,y:15} ];
+      State.dir = {x:1,y:0};
+      State.nextDir = {x:1,y:0};
+      State.score = 0;
+      State.speed = BASE_FPS;
+      State.level = 1;
+      State.foodsEaten = 0;
+      State.stepInterval = 1000/State.speed;
+      State.running = false;
+      State.gameOver = false;
+      State.trees = placeTrees(TREE_START);
+      State.food = placeFood();
+      State.treeTimerMs = 0;
+      State.treeIntervalMs = 14000; // will reduce with levels
+      draw();
+    }
+
+    // ===== Utilities =====
+    function randInt(a,b){ return (Math.random()*(b-a+1)|0)+a; }
+    function cellEq(a,b){ return a.x===b.x && a.y===b.y; }
+    function inBounds(c){ return c.x>=0 && c.y>=0 && c.x<SIZE && c.y<SIZE; }
+
+    function occSet(){
+      const set = new Set();
+      for(const s of State.snake) set.add(s.x+","+s.y);
+      for(const t of State.trees) set.add(t.x+","+t.y);
+      return set;
+    }
+    function isFree(x,y){
+      for(const s of State.snake) if(s.x===x && s.y===y) return false;
+      for(const t of State.trees) if(t.x===x && t.y===y) return false;
+      return true;
+    }
+
+    function placeTrees(n){
+      const trees = [];
+      let tries = 0;
+      while(trees.length < n && tries < 6000){
+        tries++;
+        const x = randInt(2, SIZE-3);
+        const y = randInt(2, SIZE-3);
+        if ((y===15 && x<12) || (y===14 && x<8) || (y===16 && x<8)) continue;
+        const adjacent = trees.some(t=> Math.abs(t.x-x)+Math.abs(t.y-y)===1);
+        if(adjacent) continue;
+        trees.push({x,y,seed: Math.random()});
+      }
+      return trees;
+    }
+
+    function addTree(){
+      const occ = occSet();
+      let guard=0;
+      while(guard<4000){
+        guard++;
+        const x = randInt(1,SIZE-2), y = randInt(1,SIZE-2);
+        const key = x+","+y;
+        if(!occ.has(key)) { State.trees.push({x,y,seed:Math.random()}); break; }
+      }
+    }
+
+    function placeFood(){
+      let x,y; let guard=0;
+      do{ x = randInt(0,SIZE-1); y = randInt(0,SIZE-1); guard++; if(guard>5000) break; } while(!isFree(x,y));
+      return {x,y};
+    }
+
+    // ===== Controls =====
+    const KEY = { ArrowUp:'up', ArrowDown:'down', ArrowLeft:'left', ArrowRight:'right', w:'up', s:'down', a:'left', d:'right', ' ':'space', Spacebar:'space', Enter:'enter', p:'pause', P:'pause', '1':'classic', '2':'wrap', m:'mode', M:'mode' };
+
+    function applyDir(name){
+      const d = State.dir;
+      if(name==='up' && d.y!==1){ State.nextDir = {x:0,y:-1}; }
+      else if(name==='down' && d.y!==-1){ State.nextDir = {x:0,y:1}; }
+      else if(name==='left' && d.x!==1){ State.nextDir = {x:-1,y:0}; }
+      else if(name==='right' && d.x!==-1){ State.nextDir = {x:1,y:0}; }
+    }
+
+    window.addEventListener('keydown', (e)=>{
+      const k = KEY[e.key]; if(!k) return;
+      if (audioCtx.state !== 'running') { audioCtx.resume().catch(()=>{}); }
+
+      if(k==='classic'){ State.mode='classic'; State.awaitingModePick=false; draw(); return; }
+      if(k==='wrap'){ State.mode='wrap'; State.awaitingModePick=false; draw(); return; }
+      if(k==='mode'){ if(!State.running){ State.mode = (State.mode==='classic'?'wrap':'classic'); State.awaitingModePick=false; draw(); } return; }
+
+      if(['up','down','left','right'].includes(k)){
+        e.preventDefault(); applyDir(k);
+        if(!State.running && !State.gameOver){ start(); }
+      } else if(k==='space' || k==='pause'){
+        e.preventDefault(); if(State.running) pause(); else if(!State.gameOver) start();
+      } else if(k==='enter'){
+        e.preventDefault(); if(State.gameOver){ init(); start(); } else if(!State.running){ start(); }
+      }
+    }, {passive:false});
+
+    // ===== Audio (subtle crunch) =====
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    function playCrunch(){
+      const dur = 0.08; const sr = audioCtx.sampleRate; const frames = Math.floor(dur*sr);
+      const buf = audioCtx.createBuffer(1, frames, sr); const data = buf.getChannelData(0);
+      for(let i=0;i<frames;i++){ const white = Math.random()*2-1; data[i] = (data[i-1]||0)*0.7 + white*0.3; }
+      const src = audioCtx.createBufferSource(); src.buffer = buf;
+      const filter = audioCtx.createBiquadFilter(); filter.type = 'lowpass'; filter.frequency.value = 2200;
+      const gain = audioCtx.createGain(); const g = gain.gain; const now = audioCtx.currentTime;
+      g.setValueAtTime(0.0001, now); g.exponentialRampToValueAtTime(0.2, now+0.01); g.exponentialRampToValueAtTime(0.0001, now+dur);
+      src.connect(filter).connect(gain).connect(audioCtx.destination); src.start();
+      const osc = audioCtx.createOscillator(); const og = audioCtx.createGain(); osc.type = 'square'; osc.frequency.value = 180;
+      og.gain.setValueAtTime(0.0001, now); og.gain.exponentialRampToValueAtTime(0.08, now+0.005); og.gain.exponentialRampToValueAtTime(0.0001, now+0.05);
+      osc.connect(og).connect(audioCtx.destination); osc.start(now); osc.stop(now+0.06);
+    }
+
+    // ===== Game Loop =====
+    let rafId = null;
+    function start(){ if(State.running) return; State.running = true; State.gameOver = false; State.lastStep = performance.now(); loop(State.lastStep); canvas.focus(); }
+    function pause(){ State.running = false; if(rafId) cancelAnimationFrame(rafId); draw(); }
+
+    function loop(t){
+      if(!State.running) return;
+      const elapsed = t - State.lastStep;
+      if(elapsed >= State.stepInterval){ step(elapsed); State.lastStep = t; }
+      draw();
+      rafId = requestAnimationFrame(loop);
+    }
+
+    function step(elapsedMs){
+      State.dir = State.nextDir;
+      const head = State.snake[0];
+      let nx = head.x + State.dir.x;
+      let ny = head.y + State.dir.y;
+
+      if(State.mode==='classic'){
+        if(nx<0 || ny<0 || nx>=SIZE || ny>=SIZE) return endGame();
+      } else {
+        nx = (nx + SIZE) % SIZE; ny = (ny + SIZE) % SIZE;
+      }
+      const newHead = {x:nx,y:ny};
+
+      for(let i=0;i<State.snake.length;i++){ if(cellEq(State.snake[i],newHead)) return endGame(); }
+      for(const t of State.trees){ if(cellEq(t,newHead)) return endGame(); }
+
+      State.snake.unshift(newHead);
+
+      // Eat?
+      if(cellEq(newHead, State.food)){
+        State.score += 10; State.foodsEaten += 1; playCrunch();
+        State.food = placeFood();
+        // Level-based jumps
+        maybeLevelUp();
+        // Always add some trees over time when eating too
+        if(Math.random()<0.35) addTree();
+      } else {
+        State.snake.pop();
+      }
+
+      // Time-based tree growth
+      State.treeTimerMs += elapsedMs;
+      const interval = Math.max(5000, State.treeIntervalMs - (State.level-1)*1500); // faster with levels
+      if(State.treeTimerMs >= interval){ addTree(); State.treeTimerMs = 0; }
+    }
+
+    function maybeLevelUp(){
+      const f = State.foodsEaten;
+      let newLevel = State.level;
+      if(f >= LEVELS[4]) newLevel = 5; else if(f >= LEVELS[3]) newLevel = 4; else if(f >= LEVELS[2]) newLevel = 3; else if(f >= LEVELS[1]) newLevel = 2; else newLevel = 1;
+      if(newLevel !== State.level){
+        State.level = newLevel;
+        // Speed jump per level
+        const levelSpeeds = {1: BASE_FPS, 2: 9, 3: 11, 4: 13, 5: 15};
+        State.speed = levelSpeeds[State.level];
+        State.stepInterval = 1000/State.speed;
+        // Add a burst of new trees on level up to increase difficulty
+        const burst = 2 + State.level; for(let i=0;i<burst;i++) addTree();
+      }
+    }
+
+    function endGame(){ State.running = false; State.gameOver = true; if(rafId) cancelAnimationFrame(rafId); }
+
+    // ===== Rendering =====
+    function draw(){
+      const px = CELL * SIZE;
+      drawBackground(px); drawGrid(px); drawTrees(); drawFood(); drawSnake(); drawOverlay();
+    }
+
+    function drawBackground(px){
+      const g = ctx.createLinearGradient(0,0,0,px); g.addColorStop(0, '#0c1622'); g.addColorStop(1, '#060a10');
+      ctx.fillStyle = g; ctx.fillRect(0,0,px,px);
+      const vg = ctx.createRadialGradient(px/2, px/2, px*0.1, px/2, px/2, px*0.8);
+      vg.addColorStop(0,'rgba(0,0,0,0)'); vg.addColorStop(1,'rgba(0,0,0,0.5)'); ctx.fillStyle = vg; ctx.fillRect(0,0,px,px);
+    }
+
+    function drawGrid(px){
+      ctx.save(); ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1;
+      for(let i=1;i<SIZE;i++){ const a = i*CELL + 0.5; ctx.beginPath(); ctx.moveTo(a,0); ctx.lineTo(a,px); ctx.stroke(); ctx.beginPath(); ctx.moveTo(0,a); ctx.lineTo(px,a); ctx.stroke(); }
+      ctx.restore();
+    }
+
+    function cellRect(x,y){ return [x*CELL, y*CELL, CELL, CELL]; }
+
+    function drawTrees(){
+      for(const t of State.trees){
+        const [x,y,w,h] = cellRect(t.x, t.y);
+        ctx.save(); ctx.translate(x,y);
+        ctx.fillStyle = '#5b3f2a'; ctx.fillRect(w*0.45, h*0.45, w*0.1, h*0.55);
+        const leafG = ctx.createRadialGradient(w*0.5,h*0.5, w*0.15, w*0.5,h*0.5, w*0.55);
+        leafG.addColorStop(0, '#2f7d32'); leafG.addColorStop(1, '#1b4d1e');
+        ctx.fillStyle = leafG; roundedRect(ctx, w*0.1, h*0.05, w*0.8, h*0.7, 6); ctx.fill();
+        ctx.globalAlpha = 0.15; ctx.fillStyle = '#fff'; roundedRect(ctx, w*0.15, h*0.1, w*0.7, h*0.25, 6); ctx.fill(); ctx.globalAlpha = 1; ctx.restore();
+      }
+    }
+
+    function drawFood(){
+      const f = State.food; const [x,y,w,h] = cellRect(f.x,f.y);
+      ctx.save(); ctx.translate(x,y);
+      // High-visibility golden rat with outline and soft pulse
+      const t = performance.now()*0.002;
+      const pulse = (Math.sin(t)+1)/2; // 0..1
+      const glowAlpha = 0.25 + 0.25*pulse;
+      // glow
+      const rg = ctx.createRadialGradient(w*0.5, h*0.55, 1, w*0.5, h*0.55, Math.max(w,h)*0.6);
+      rg.addColorStop(0, `rgba(255,215,0,${glowAlpha})`);
+      rg.addColorStop(1, 'rgba(255,215,0,0)');
+      ctx.fillStyle = rg; ctx.globalAlpha = 0.8; ctx.fillRect(-w*0.5, -h*0.5, w*2, h*2); ctx.globalAlpha = 1;
+      // body
+      ctx.fillStyle = '#ffd54d';
+      ellipse(ctx, w*0.45, h*0.6, w*0.32, h*0.24, true);
+      // head
+      ellipse(ctx, w*0.25, h*0.55, w*0.2, h*0.18, true);
+      // ear
+      ctx.fillStyle = '#ff9e80'; ellipse(ctx, w*0.18, h*0.45, w*0.07, h*0.07, true);
+      // eye
+      ctx.fillStyle = '#111'; ellipse(ctx, w*0.29, h*0.56, w*0.025, h*0.025, true);
+      // outline
+      ctx.strokeStyle = '#fff2cc'; ctx.lineWidth = 2; ctx.stroke();
+      // tail
+      ctx.strokeStyle = '#e0a000'; ctx.lineWidth = 2; ctx.beginPath();
+      ctx.moveTo(w*0.72, h*0.63); ctx.quadraticCurveTo(w*0.95, h*0.6, w*1.02, h*0.7); ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawSnake(){
+      for(let i=State.snake.length-1;i>=0;i--){
+        const seg = State.snake[i]; const [x,y,w,h] = cellRect(seg.x, seg.y);
+        const isHead = (i===0); const isTail = (i===State.snake.length-1);
+        switch(formStage()){
+          case 0: drawSnakeSegment_Hatchling(x,y,w,h,isHead,isTail,i); break;
+          case 1: drawSnakeSegment_Juvenile(x,y,w,h,isHead,isTail,i); break;
+          case 2: drawSnakeSegment_Anaconda(x,y,w,h,isHead,isTail,i); break;
+          case 3: drawSnakeSegment_Cobra(x,y,w,h,isHead,isTail,i); break;
+        }
+      }
+    }
+
+    // Visual evolution thresholds (by length)
+    function formStage(){ const L = State.snake.length; if(L < 8) return 0; if(L < 16) return 1; if(L < 24) return 2; return 3; }
+
+    function drawSnakeSegment_Hatchling(x,y,w,h,isHead){
+      ctx.save(); ctx.translate(x,y);
+      const g = ctx.createLinearGradient(0,0,0,h); g.addColorStop(0,'#7be77e'); g.addColorStop(1,'#2d8f34');
+      ctx.fillStyle = g; roundedRect(ctx, w*0.12, h*0.12, w*0.76, h*0.76, 6); ctx.fill();
+      glossy(x,y,w,h); if(isHead){ drawEyes(w,h, State.dir); }
+      ctx.restore();
+    }
+
+    function drawSnakeSegment_Juvenile(x,y,w,h,isHead){
+      ctx.save(); ctx.translate(x,y);
+      // brown gradient + subtle scale texture
+      const g = ctx.createLinearGradient(0,0,0,h); g.addColorStop(0,'#a87a3d'); g.addColorStop(1,'#6e4b21');
+      ctx.fillStyle = g; roundedRect(ctx, w*0.1, h*0.1, w*0.8, h*0.8, 6); ctx.fill();
+      ctx.globalAlpha = 0.22; ctx.fillStyle = '#503516';
+      for(let yy=0; yy<h*0.8; yy+=h*0.2){ for(let xx=0; xx<w*0.8; xx+=w*0.2){ ellipse(ctx, w*0.1+xx, h*0.1+yy, w*0.12, h*0.08, true); } }
+      ctx.globalAlpha = 1; glossy(x,y,w,h); if(isHead){ drawEyes(w,h, State.dir); }
+      ctx.restore();
+    }
+
+    function drawSnakeSegment_Anaconda(x,y,w,h,isHead){
+      ctx.save(); ctx.translate(x,y);
+      // grey body with darker blotches
+      const g = ctx.createLinearGradient(0,0,0,h); g.addColorStop(0,'#b3b7bb'); g.addColorStop(1,'#5b6166');
+      ctx.fillStyle = g; roundedRect(ctx, w*0.08, h*0.08, w*0.84, h*0.84, 5); ctx.fill();
+      ctx.globalAlpha = 0.65; ctx.fillStyle = '#3a3f44';
+      ellipse(ctx, w*0.30, h*0.35, w*0.30, h*0.22, true);
+      ellipse(ctx, w*0.58, h*0.62, w*0.28, h*0.20, true);
+      ctx.globalAlpha = 1; glossy(x,y,w,h); if(isHead){ drawEyes(w,h, State.dir); }
+      ctx.restore();
+    }
+
+    function drawSnakeSegment_Cobra(x,y,w,h,isHead){
+      ctx.save(); ctx.translate(x,y);
+      // brown base with gold banding
+      const g = ctx.createLinearGradient(0,0,0,h); g.addColorStop(0,'#7a5a3a'); g.addColorStop(1,'#5a4028');
+      ctx.fillStyle = g; roundedRect(ctx, w*0.06, h*0.06, w*0.88, h*0.88, 4); ctx.fill();
+      // gold bands
+      ctx.fillStyle = 'rgba(230,194,94,0.45)';
+      for(let yy=h*0.14; yy<h*0.88; yy+=h*0.20){ ctx.fillRect(w*0.06, yy, w*0.88, h*0.06); }
+      if(isHead){
+        // subtle gold hood flare
+        ctx.fillStyle = 'rgba(230,194,94,0.3)';
+        ctx.beginPath(); ctx.moveTo(w*0.5, h*0.12);
+        ctx.quadraticCurveTo(-w*0.25, h*0.5, w*0.5, h*0.88);
+        ctx.quadraticCurveTo(w*1.25, h*0.5, w*0.5, h*0.12);
+        ctx.closePath(); ctx.fill();
+        drawEyes(w,h, State.dir);
+      }
+      glossy(x,y,w,h);
+      ctx.restore();
+    }
+
+    function drawEyes(w,h,dir){
+      ctx.fillStyle = '#fff';
+      let ex = 0.5, ey = 0.5;
+      if(dir.x===1){ ex = 0.65; } if(dir.x===-1){ ex = 0.35; }
+      if(dir.y===1){ ey = 0.65; } if(dir.y===-1){ ey = 0.35; }
+      ellipse(ctx, w*ex-2, h*ey-2, 4, 4, true);
+      ctx.fillStyle = '#111'; ellipse(ctx, w*ex-1, h*ey-1, 2, 2, true);
+    }
+
+    function glossy(x,y,w,h){ ctx.save(); ctx.translate(x,y); ctx.globalAlpha = 0.12; ctx.fillStyle = '#fff'; roundedRect(ctx, w*0.12, h*0.12, w*0.76, h*0.18, 6); ctx.fill(); ctx.globalAlpha=1; ctx.restore(); }
+
+    function drawOverlay(){
+      const px = CELL*SIZE;
+      // Non-obstructive HUD: just text with shadow, no background box
+      ctx.save();
+      ctx.font = '16px system-ui, sans-serif';
+      ctx.textBaseline = 'top';
+      ctx.shadowColor = 'rgba(0,0,0,0.8)';
+      ctx.shadowBlur = 6; ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 0;
+      ctx.fillStyle = '#e9f4ff';
+      ctx.fillText('Score: ' + State.score, 10, 10);
+      ctx.fillText('Len: ' + State.snake.length, 10, 30);
+      ctx.fillText('Lvl: ' + State.level + ' · ' + (State.mode==='classic'?'Classic':'Wrap'), 10, 50);
+      ctx.restore();
+
+      if(!State.running && !State.gameOver){
+        if(State.awaitingModePick){ overlayText('Choose Mode', 'Press 1: Classic walls  ·  2: Wrap.  M toggles. Enter to start'); }
+        else { overlayText('Press Enter or Arrow Key to Start', 'Arrows to move · Space to pause · M to toggle mode'); }
+      }
+      if(State.gameOver){ overlayText('Game Over', 'Press Enter to restart'); }
+    }
+
+    function overlayText(title, subtitle){
+      const px = CELL*SIZE; ctx.save(); ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(px*0.1, px*0.33, px*0.8, px*0.24);
+      ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 2; ctx.strokeRect(px*0.1, px*0.33, px*0.8, px*0.24);
+      ctx.fillStyle = '#e8f3ff'; ctx.font = 'bold ' + Math.floor(px*0.045) + 'px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(title, px*0.5, px*0.39);
+      ctx.font = Math.floor(px*0.026) + 'px system-ui, sans-serif'; ctx.fillStyle = '#bcd7f3'; ctx.fillText(subtitle, px*0.5, px*0.47);
+      ctx.restore();
+    }
+
+    // ===== Primitive helpers =====
+    function roundedRect(ctx, x, y, w, h, r){ ctx.beginPath(); ctx.moveTo(x+r, y); ctx.lineTo(x+w-r, y); ctx.quadraticCurveTo(x+w, y, x+w, y+r); ctx.lineTo(x+w, y+h-r); ctx.quadraticCurveTo(x+w, y+h, x+w-r, y+h); ctx.lineTo(x+r, y+h); ctx.quadraticCurveTo(x, y+h, x, y+h-r); ctx.lineTo(x, y+r); ctx.quadraticCurveTo(x, y, x+r, y); ctx.closePath(); }
+    function ellipse(ctx, cx, cy, rx, ry, fill){ ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI*2); if(fill) ctx.fill(); else ctx.stroke(); }
+
+    // ===== Kickoff =====
+    init(); resize();
+  })();
+  </script>
+</body>
+</html>
